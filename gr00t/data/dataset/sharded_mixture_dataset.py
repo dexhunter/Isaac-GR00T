@@ -320,6 +320,8 @@ class ShardedMixtureDataset(IterableDataset):
             List of (dataset_index, shard_index) tuples defining the sampling order
         """
         if self.training:
+            from itertools import chain
+
             rng = np.random.default_rng(self.seed + self.epoch)
 
             # Compute average shard sizes for normalization
@@ -342,22 +344,45 @@ class ShardedMixtureDataset(IterableDataset):
             )
 
             # Generate shuffled shard indices for each dataset
-            shard_sampling_schedule = []
             shards_to_sample = []
+            shuffle = rng.shuffle
+
+            def cycle_shards(shard_ids, template):
+                while True:
+                    yield shard_ids
+                    shard_ids = template.copy()
+                    shuffle(shard_ids)
+
             for dataset in self.datasets:
                 shard_ids = list(range(len(dataset)))
-                rng.shuffle(shard_ids)
-                shards_to_sample.append(shard_ids)
+                template = shard_ids.copy()
+                shuffle(shard_ids)
+                shards_to_sample.append(chain.from_iterable(cycle_shards(shard_ids, template)))
 
             # Create final sampling schedule with shard cycling
-            for i in dataset_sampling_schedule:
-                # Reshuffle and refill if dataset shards are exhausted
-                if len(shards_to_sample[i]) == 0:
-                    shard_ids = list(range(len(self.datasets[i])))
-                    rng.shuffle(shard_ids)
-                    shards_to_sample[i] = shard_ids
-                shard_idx = shards_to_sample[i].pop(0)
-                shard_sampling_schedule.append((i, shard_idx))
+            if len(self.datasets) == 1 and np.ndim(dataset_sampling_schedule) == 1:
+                if len(dataset_sampling_schedule):
+                    # Permute independent rows in cycle order, retaining tuple references.
+                    dataset_idx = dataset_sampling_schedule[0]
+                    pairs = [(dataset_idx, j) for j in template]
+                    schedule_size = len(dataset_sampling_schedule)
+                    shard_count = len(pairs)
+                    shard_sampling_schedule = [pairs[j] for j in shard_ids[:schedule_size]]
+                    remaining = schedule_size - len(shard_sampling_schedule)
+                    if remaining:
+                        pair_array = np.empty(shard_count, dtype=object)
+                        pair_array[:] = pairs
+                        cycle_count = (remaining + shard_count - 1) // shard_count
+                        cycles = rng.permuted(
+                            np.broadcast_to(pair_array, (cycle_count, shard_count)), axis=1
+                        )
+                        shard_sampling_schedule.extend(cycles.reshape(-1)[:remaining].tolist())
+                else:
+                    shard_sampling_schedule = []
+            else:
+                shard_sampling_schedule = [
+                    (i, next(shards_to_sample[i])) for i in dataset_sampling_schedule
+                ]
 
         else:
             # Evaluation mode: sample every shard exactly once
